@@ -1,0 +1,218 @@
+---
+title: "Laboratório R"
+author: "Bruno Albuquerque"
+date: "2025-10-01"
+output: html_document
+---
+
+## Proposta
+
+Este trabalho investiga a dinâmica entre as principais variáveis macroeconômicas e de mercado do Brasil no período de janeiro de 2020 a setembro de 2025. O objetivo é analisar como a Taxa Selic, principal instrumento de política monetária do Banco Central, se relaciona com a inflação oficial (IPCA) e qual o impacto dessas decisões no mercado de capitais, representado pelo índice Ibovespa.
+
+A análise parte da hipótese de que elevações na Selic são utilizadas para conter a inflação, mas podem desestimular o investimento em renda variável, enquanto cortes na taxa podem ter o efeito oposto.
+
+```{r, include=FALSE, message=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+req_packages <- c("data.table", "dplyr", "tidyr", "ggplot2", "sidrar", 
+                  "tidyquant", "lubridate", "janitor", "scales")
+new_packages <- setdiff(req_packages, rownames(installed.packages()))
+if (length(new_packages)) install.packages(new_packages, dependencies = TRUE)
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(sidrar)
+library(tidyquant)
+library(lubridate)
+library(janitor)
+library(scales)
+
+dir.create("dados_raw", showWarnings = FALSE)
+dir.create("graficos", showWarnings = FALSE)
+
+theme_set(theme_light())
+
+
+
+```
+
+## Coleta e Tratamento dos Dados
+
+Nesta seção, realizamos a coleta e limpeza de três fontes de dados distintas: a Taxa Selic diária (arquivo CSV), a variação mensal do IPCA (via API do SIDRA/IBGE) e a cotação diária do índice Ibovespa (via API do Yahoo Finance).
+
+### 1. Taxa Selic (Dados Diários)
+
+Os dados da Selic foram lidos a partir de um arquivo CSV local. A limpeza envolveu a remoção de linhas de cabeçalho, a seleção de colunas relevantes e a conversão dos tipos de dados.
+
+```{r load-selic}
+selic_path <- "taxa_selic_apurada.csv"
+
+selic_diaria <- fread(selic_path, skip = 1, sep = ";", dec = ",") %>%
+  as_tibble() %>%
+  clean_names() %>%
+  transmute(
+    data = dmy(.data$data),
+    taxa_selic_aa = as.numeric(taxa_percent_a_a)
+  ) %>%
+  filter(!is.na(data))
+
+glimpse(selic_diaria)
+```
+
+### 2. Inflação - IPCA (Dados Mensais via SIDRA)
+
+A variação mensal do IPCA foi obtida diretamente da API do SIDRA/IBGE.
+
+```{r load-ipca}
+ipca_mensal <- get_sidra(
+  api = "/t/1737/n1/all/v/63/p/202001-202509/d/v63%202"
+) %>%
+  as_tibble() %>%
+  transmute(
+    data = ym(`Mês (Código)`), 
+    ipca_variacao_mes = as.numeric(Valor)
+  ) %>%
+  filter(!is.na(data))
+
+glimpse(ipca_mensal)
+```
+
+### 3. Ibovespa (Dados Diários via Yahoo Finance)
+
+Os dados de fechamento do índice Ibovespa foram coletados da API do Yahoo Finance.
+
+```{r load-ibovespa}
+ticker <- "^BVSP"
+de <- "2020-01-01"
+ate <- "2025-09-30"
+
+ibov_diario <- tq_get(ticker, from = de, to = ate) %>%
+  as_tibble() %>%
+  select(data = date, ibov_fechamento = adjusted)
+
+glimpse(ibov_diario)
+```
+
+## Integração e Preparação dos Dados
+
+Para comparar as três variáveis, os dados diários da Selic e do Ibovespa foram agregados para uma frequência mensal. Em seguida, as três bases foram unidas.
+
+```{r data-integration}
+selic_mensal <- selic_diaria %>%
+  mutate(mes_ano = floor_date(data, "month")) %>%
+  group_by(mes_ano) %>%
+  summarise(selic_media_mes = mean(taxa_selic_aa, na.rm = TRUE))
+
+ibov_mensal <- ibov_diario %>%
+  mutate(mes_ano = floor_date(data, "month")) %>%
+  group_by(mes_ano) %>%
+  summarise(
+    ibov_retorno_mes = (last(ibov_fechamento) / first(ibov_fechamento)) - 1
+  ) %>%
+  mutate(ibov_retorno_acum = cumprod(1 + ibov_retorno_mes) - 1)
+
+dados_mensais <- selic_mensal %>%
+  left_join(ipca_mensal, by = c("mes_ano" = "data")) %>%
+  left_join(ibov_mensal, by = "mes_ano") %>%
+  filter(!is.na(ipca_variacao_mes))
+
+glimpse(dados_mensais)
+```
+
+## Análise Gráfica e Interpretação
+
+Com os dados integrados, podemos visualizar a relação entre as variáveis.
+
+### Gráfico 1: Painel Macroeconômico - Selic, IPCA e Ibovespa no Tempo
+
+Este gráfico sobrepõe a evolução da Taxa Selic, da inflação mensal e do desempenho acumulado do Ibovespa, permitindo uma análise visual da interação entre política monetária e mercado de capitais.
+
+```{r plot-painel-macro, fig.width=12, fig.height=7}
+scale_factor <- max(dados_mensais$selic_media_mes) / max(dados_mensais$ibov_retorno_acum)
+
+ggplot(dados_mensais, aes(x = mes_ano)) +
+  geom_line(aes(y = selic_media_mes, color = "Taxa Selic Média"), size = 1.2) +
+  geom_line(aes(y = ipca_variacao_mes, color = "IPCA (Var. Mensal)"), size = 1.2, linetype = "dashed") +
+
+  geom_line(aes(y = ibov_retorno_acum * scale_factor, color = "Ibovespa (Ret. Acum.)"), size = 1.2) +
+  
+  scale_y_continuous(
+    name = "Taxa Média Mensal (%)",
+    sec.axis = sec_axis(~ . / scale_factor, name = "Retorno Acumulado Ibovespa", labels = scales::percent)
+  ) +
+  
+  scale_color_manual(
+    name = "Variáveis",
+    values = c("Taxa Selic Média" = "darkblue", "IPCA (Var. Mensal)" = "red", "Ibovespa (Ret. Acum.)" = "darkgreen")
+  ) +
+  
+  labs(
+    title = "Evolução da Selic, IPCA e Ibovespa (2020 - 2025)",
+    subtitle = "A Taxa Selic reage à inflação, com impactos no retorno da bolsa",
+    x = "Data",
+    y = "Taxas (%)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+ggsave("graficos/painel_macro.png", width = 12, height = 7)
+```
+
+Este gráfico busca apresentar o panorama macroeconômico geral, mostrando a interação entre as três variáveis ao longo do tempo.
+
+Primeiramente, é importante notar que, devido a uma grande diferença de escala entre as variáveis, as linhas da Taxa Selic (azul) e do IPCA (vermelha) aparecem "achatadas" no topo do gráfico, próximas a zero.
+
+A trajetória do Ibovespa revela a extrema volatilidade do período:
+
+- Início de 2020: O gráfico captura o impacto inicial da pandemia de COVID-19, com uma queda vertiginosa que levou o retorno acumulado a quase -40%.
+
+- 2020-2021: Segue-se um período de forte recuperação, no qual o mercado recupera as perdas em meio aos estímulos econômicos e à reabertura gradual.
+
+- 2022-2023: O Ibovespa entra em um período de alta volatilidade e tendência lateral/baixa. Este período coincide com o ciclo de aperto monetário no Brasil, onde o Banco Central elevou a Selic para combater a alta da inflação. Juros altos na renda fixa tornam o investimento em ações menos atraente, o que explica a dificuldade do Ibovespa em avançar.
+
+- 2024-2025: Com a inflação mais controlada e o início de um ciclo de cortes na Taxa Selic, o mercado de ações retoma uma trajetória de alta, buscando recuperar o patamar inicial e encerrando o período próximo do zero a zero.
+
+Em suma, embora a escala dificulte a visualização da Selic e do IPCA, a história contada pelo Ibovespa está alinhado com o esperado: a bolsa sofreu com a crise inicial, se recuperou com juros baixos e, em seguida, enfrentou um período difícil durante o ciclo de alta dos juros, voltando a se recuperar quando a política monetária se tornou mais branda.
+
+### Gráfico 2: Correlação entre Taxa Selic e Retorno do Ibovespa
+
+Este gráfico de dispersão investiga diretamente a relação entre a taxa de juros e o desempenho mensal da bolsa de valores. Cada ponto representa um mês no período analisado.
+
+```{r plot-correlacao-selic-ibov, fig.width=10, fig.height=6}
+ggplot(dados_mensais, aes(x = selic_media_mes, y = ibov_retorno_mes)) +
+  geom_point(aes(color = ibov_retorno_mes > 0), size = 3, alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_manual(values = c("firebrick", "steelblue")) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(
+    title = "Relação entre a Taxa Selic Média e o Retorno Mensal do Ibovespa",
+    subtitle = "Cada ponto representa um mês entre 2020 e 2025",
+    x = "Taxa Selic Média Mensal (%)",
+    y = "Retorno Mensal do Ibovespa (%)"
+  )
+
+ggsave("graficos/correlacao_selic_ibov.png", width = 10, height = 6)
+```
+
+Este gráfico de dispersão tenta testar a teoria de que "juros altos são ruins para a bolsa". Cada ponto no gráfico representa o desempenho de um mês.
+
+A principal conclusão é que a realidade é muito mais complexa. A linha de tendência (pontilhada em preto) é quase horizontal, indicando que não existe uma correlação linear forte e direta entre o nível da Taxa Selic e o retorno do Ibovespa em um determinado mês. Um mês de Selic alta não garante um resultado negativo na bolsa, e vice-versa.
+
+Podemos observar alguns padrões interessantes:
+
+Em cenários de Selic baixa (à esquerda, entre 2-5%): Houve uma grande dispersão nos resultados. Neste período, ocorreram tanto alguns dos meses de maior alta (pontos azuis mais altos) quanto o pior mês de todo o período (o ponto vermelho mais baixo, provavelmente março de 2020). Isso sugere que, com juros baixos, outros fatores (como crises inesperadas, otimismo econômico, etc.) se tornam os principais motores do mercado, gerando alta volatilidade.
+
+Em cenários de Selic alta (à direita, acima de 10%): Contrariando a intuição, vemos muitos meses de retorno positivo (pontos azuis). Isso mostra que, mesmo com a forte competição da renda fixa, a bolsa pode performar bem, possivelmente impulsionada por bons resultados corporativos, fluxo de capital estrangeiro ou a expectativa de futuros cortes nos juros.
+
+A mistura de pontos azuis (meses positivos) e vermelhos (meses negativos) ao longo de todo o eixo da Taxa Selic reforça a mensagem principal: o nível dos juros é um fator de grande importância no cenário macro, mas o desempenho mensal da bolsa é influenciado por uma gama muito maior de variáveis, incluindo lucros das empresas, cenário político e humor dos investidores globais.
+
+### Definições
+
+* **Taxa Selic (% a.a.):** Taxa básica de juros da economia brasileira, definida pelo Comitê de Política Monetária (Copom) do Banco Central.
+* **IPCA (Var. Mensal %):** Índice Nacional de Preços ao Consumidor Amplo, considerado a inflação oficial do país. Mede a variação de preços de uma cesta de produtos e serviços.
+* **Ibovespa (Fechamento):** Índice que representa o desempenho médio das ações mais negociadas e representativas da bolsa de valores brasileira, a B3.
+* **Retorno Mensal:** Variação percentual do Ibovespa do primeiro ao último dia de um determinado mês.
